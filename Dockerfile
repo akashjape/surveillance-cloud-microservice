@@ -2,7 +2,7 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install Modern OpenCV System Dependencies
+# Install System Dependencies for OpenCV & OpenVINO
 RUN apt-get update && apt-get install -y \
     libgl1 \
     libglib2.0-0 \
