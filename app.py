@@ -56,12 +56,21 @@ def get_openvino_model(name: str, xml_filename: str):
         Path(xml_filename),
         Path("models") / xml_filename,
         Path("models") / "openvino" / xml_filename,
+        Path("models") / "openvino" / "yolo11n-pose_openvino_model" / xml_filename,
     ]
     for p in candidate_paths:
         if p.exists():
+            bin_p = p.with_suffix(".bin")
+            if bin_p.exists():
+                st_size = bin_p.stat().st_size
+                if st_size < 1000:
+                    print(f"⚠️ Warning: {bin_p} is only {st_size} bytes (Git LFS pointer text file). OpenVINO requires actual binary weights.")
             try:
                 core = get_ov_core()
-                model = core.read_model(str(p))
+                if bin_p.exists() and bin_p.stat().st_size > 1000:
+                    model = core.read_model(model=str(p), weights=str(bin_p))
+                else:
+                    model = core.read_model(str(p))
                 compiled = core.compile_model(model, "CPU")
                 print(f"✅ Lazy Loaded OpenVINO Model: {p}")
                 _COMPILED_MODELS[name] = compiled
