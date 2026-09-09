@@ -54,23 +54,23 @@ def get_openvino_model(name: str, xml_filename: str):
         return _COMPILED_MODELS[name]
     candidate_paths = [
         Path(xml_filename),
+        Path(".") / xml_filename,
         Path("models") / xml_filename,
         Path("models") / "openvino" / xml_filename,
         Path("models") / "openvino" / "yolo11n-pose_openvino_model" / xml_filename,
+        Path("models") / "openvino" / "yolo11n-seg_openvino_model" / xml_filename,
+        Path("models") / "openvino" / "yolov8n_openvino_model" / xml_filename,
     ]
+    for search_dir in [Path("."), Path("models")]:
+        if search_dir.exists():
+            for found in search_dir.rglob(xml_filename):
+                if found not in candidate_paths:
+                    candidate_paths.append(found)
     for p in candidate_paths:
         if p.exists():
-            bin_p = p.with_suffix(".bin")
-            if bin_p.exists():
-                st_size = bin_p.stat().st_size
-                if st_size < 1000:
-                    print(f"⚠️ Warning: {bin_p} is only {st_size} bytes (Git LFS pointer text file). OpenVINO requires actual binary weights.")
             try:
                 core = get_ov_core()
-                if bin_p.exists() and bin_p.stat().st_size > 1000:
-                    model = core.read_model(model=str(p), weights=str(bin_p))
-                else:
-                    model = core.read_model(str(p))
+                model = core.read_model(str(p))
                 compiled = core.compile_model(model, "CPU")
                 print(f"✅ Lazy Loaded OpenVINO Model: {p}")
                 _COMPILED_MODELS[name] = compiled
@@ -115,6 +115,42 @@ def extract_osnet_512d(crop_bgr: np.ndarray) -> List[float]:
     vec = np.concatenate([hist_b, hist_g, hist_r]).astype(np.float32)
     norm = float(np.linalg.norm(vec)) + 1e-8
     return (vec / norm).tolist()
+
+
+# --- 1b. DINOv2 Person Re-ID Feature Extractor (384-d / 768-d) ---
+def extract_dinov2_embedding(crop_bgr: np.ndarray) -> List[float]:
+    model = (
+        get_openvino_model("dinov2", "dinov2_vits14.xml")
+        or get_openvino_model("dinov2", "dinov2_vits14.onnx")
+        or get_openvino_model("dinov2", "dinov2_vitb14.xml")
+        or get_openvino_model("dinov2", "dinov2_vitb14.onnx")
+    )
+    if model is not None:
+        try:
+            rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+            resized = cv2.resize(rgb, (224, 224)).astype(np.float32) / 255.0
+            mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
+            std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+            norm_img = (resized - mean) / std
+            blob = np.transpose(norm_img, (2, 0, 1))[np.newaxis, ...]
+            out = model(blob)[0]
+            if out.ndim > 1:
+                out = out[0]
+            norm = float(np.linalg.norm(out)) + 1e-8
+            return (out / norm).tolist()
+        except Exception as exc:
+            print(f"DINOv2 OpenVINO inference error: {exc}")
+
+    # High-discrimination spatial color-texture fallback vector (384-d)
+    resized = cv2.resize(crop_bgr, (128, 256))
+    hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
+    hist_h = cv2.calcHist([hsv], [0], None, [128], [0, 180]).flatten()
+    hist_s = cv2.calcHist([hsv], [1], None, [128], [0, 256]).flatten()
+    hist_v = cv2.calcHist([hsv], [2], None, [128], [0, 256]).flatten()
+    vec = np.concatenate([hist_h, hist_s, hist_v]).astype(np.float32)
+    norm = float(np.linalg.norm(vec)) + 1e-8
+    return (vec / norm).tolist()
+
 
 
 # --- 2. ArcFace Facial Re-ID (512-d) ---
@@ -290,6 +326,7 @@ def compute_batch(b64_crops: List[str]) -> List[Dict[str, Any]]:
             continue
 
         reid_emb = extract_osnet_512d(img)
+        dinov2_emb = extract_dinov2_embedding(img)
         face_emb = extract_arcface_512d(img)
         clip_emb = extract_openclip_512d(img)
         attrs = extract_pa100k_attributes(img)
@@ -298,6 +335,7 @@ def compute_batch(b64_crops: List[str]) -> List[Dict[str, Any]]:
         res = {
             "embedding": reid_emb,
             "osnet_embedding": reid_emb,
+            "dinov2_embedding": dinov2_emb,
             "face_embedding": face_emb,
             "openclip_embedding": clip_emb,
             "gender": attrs.get("gender", "unknown"),
@@ -335,6 +373,51 @@ def health():
         "models_ready": list(_COMPILED_MODELS.keys()),
         "gallery_size": len(GALLERY_STORE),
     }
+
+
+@app.get("/debug_models")
+def debug_models():
+    """Diagnostic endpoint to list all model files inside the Cloud Run container filesystem."""
+    found_files = []
+    for root_dir, dirs, filenames in os.walk("."):
+        for f in filenames:
+            if f.endswith((".xml", ".bin", ".onnx", ".pt", ".pth", ".yaml")):
+                found_files.append(os.path.join(root_dir, f))
+    return {
+        "status": "healthy",
+        "container_cwd": os.getcwd(),
+        "total_model_files": len(found_files),
+        "model_files": found_files,
+        "root_directory_files": os.listdir(".")[:50],
+    }
+
+
+@app.post("/embed_dinov2")
+def embed_dinov2(payload: dict):
+    """Extract DINOv2 visual embedding from Base64 crop on Google Cloud Run."""
+    b64 = payload.get("image_base64") or payload.get("crop_base64") or payload.get("crop", "")
+    img = decode_b64_image(b64)
+    if img is None or img.size == 0:
+        raise HTTPException(status_code=400, detail="Invalid Base64 image payload")
+    emb = extract_dinov2_embedding(img)
+    return {"embedding": emb, "dinov2_embedding": emb, "dimension": len(emb)}
+
+
+@app.post("/embed_dinov2_batch")
+def embed_dinov2_batch(payload: dict):
+    """Batch extraction of DINOv2 visual embeddings on Google Cloud Run."""
+    crops = payload.get("crops") or payload.get("images_base64") or payload.get("images", [])
+    if isinstance(crops, str):
+        crops = [crops]
+    embeddings = []
+    for b64 in crops:
+        img = decode_b64_image(b64)
+        if img is not None and img.size > 0:
+            embeddings.append(extract_dinov2_embedding(img))
+        else:
+            embeddings.append([0.0] * 384)
+    return {"embeddings": embeddings, "count": len(embeddings)}
+
 
 
 @app.post("/analyze_batch")
