@@ -172,8 +172,52 @@ def extract_arcface_512d(crop_bgr: np.ndarray) -> Optional[List[float]]:
 
 
 # --- 3. OpenCLIP Multi-Modal Vector (512-d) ---
+_clip_tokenizer = None
+
+def get_clip_tokenizer():
+    global _clip_tokenizer
+    if _clip_tokenizer is None:
+        try:
+            import open_clip
+            _clip_tokenizer = open_clip.get_tokenizer("ViT-B-32")
+        except Exception:
+            _clip_tokenizer = None
+    return _clip_tokenizer
+
+
+def extract_openclip_text_512d(text: str) -> Optional[List[float]]:
+    """Encode natural language text query into 512-d OpenCLIP vector using OpenVINO."""
+    if not text or not text.strip():
+        return None
+
+    model = (
+        get_openvino_model("openclip_text", "openclip_text_encoder.xml")
+        or get_openvino_model("openclip_text", "openclip_text_encoder.onnx")
+    )
+    if model is None:
+        return None
+
+    prompt = f"a surveillance camera crop of a {text.strip()}"
+    tokenizer = get_clip_tokenizer()
+    if tokenizer is None:
+        return None
+
+    try:
+        tokens = tokenizer([prompt]).numpy().astype(np.int32)
+        res = model(tokens)
+        vec = list(res.values())[0].reshape(-1).astype(np.float32)
+        norm = float(np.linalg.norm(vec)) + 1e-8
+        return (vec / norm).tolist()
+    except Exception as exc:
+        print(f"OpenCLIP text encoder OpenVINO inference error: {exc}")
+        return None
+
+
 def extract_openclip_512d(crop_bgr: np.ndarray) -> Optional[List[float]]:
-    model = get_openvino_model("openclip", "openclip_image_encoder.xml")
+    model = (
+        get_openvino_model("openclip", "openclip_image_encoder.xml")
+        or get_openvino_model("openclip", "openclip_image_encoder.onnx")
+    )
     if model is None:
         return None
     try:
@@ -401,8 +445,6 @@ def embed_dinov2(payload: dict):
         raise HTTPException(status_code=400, detail="Invalid Base64 image payload")
     emb = extract_dinov2_embedding(img)
     return {"embedding": emb, "dinov2_embedding": emb, "dimension": len(emb)}
-
-
 @app.post("/embed_dinov2_batch")
 def embed_dinov2_batch(payload: dict):
     """Batch extraction of DINOv2 visual embeddings on Google Cloud Run."""
@@ -417,6 +459,43 @@ def embed_dinov2_batch(payload: dict):
         else:
             embeddings.append([0.0] * 384)
     return {"embeddings": embeddings, "count": len(embeddings)}
+
+
+@app.post("/embed_text")
+@app.post("/encode_text")
+def embed_text(payload: dict):
+    """Encode natural language text query into 512-d OpenCLIP vector on Google Cloud Run."""
+    text = payload.get("text") or payload.get("query") or payload.get("prompt", "")
+    if not text or not str(text).strip():
+        raise HTTPException(status_code=400, detail="Missing text/query in request payload")
+
+    emb = extract_openclip_text_512d(str(text))
+    if emb is None or len(emb) != 512:
+        raise HTTPException(status_code=503, detail="OpenCLIP text encoder model unavailable on microservice")
+
+    return {
+        "status": "success",
+        "text": str(text),
+        "embedding": emb,
+        "dimension": len(emb),
+        "model": "openclip_vit_b32_openvino",
+    }
+
+
+@app.post("/embed_text_batch")
+def embed_text_batch(payload: dict):
+    """Batch extraction of OpenCLIP text vectors on Google Cloud Run."""
+    texts = payload.get("texts") or payload.get("queries", [])
+    if isinstance(texts, str):
+        texts = [texts]
+
+    embeddings = []
+    for t in texts:
+        emb = extract_openclip_text_512d(str(t)) if t else None
+        embeddings.append(emb if emb is not None else [0.0] * 512)
+
+    return {"status": "success", "embeddings": embeddings, "count": len(embeddings)}
+
 
 
 
