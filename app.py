@@ -218,23 +218,48 @@ def extract_openclip_text_512d(text: str) -> Optional[List[float]]:
 
     try:
         tokens_pt = tokenizer([prompt])
+        tokens_np = tokens_pt.numpy() if hasattr(tokens_pt, "numpy") else np.array(tokens_pt)
         inputs = model.inputs
-        feed_dict = {}
-        for inp in inputs:
-            name = inp.get_any_name().lower()
-            element_type_str = str(inp.get_element_type()).lower()
+
+        if len(inputs) == 1:
+            element_type_str = str(inputs[0].get_element_type()).lower()
             is_int64 = "64" in element_type_str or "long" in element_type_str
             t_dtype = np.int64 if is_int64 else np.int32
+            res = model(tokens_np.astype(t_dtype))
+        else:
+            feed_dict = {}
+            for inp in inputs:
+                name = inp.get_any_name().lower()
+                element_type_str = str(inp.get_element_type()).lower()
+                is_int64 = "64" in element_type_str or "long" in element_type_str
+                t_dtype = np.int64 if is_int64 else np.int32
 
-            if "mask" in name:
-                feed_dict[inp] = (tokens_pt.numpy() != 0).astype(t_dtype)
+                if "mask" in name:
+                    feed_dict[inp] = (tokens_np != 0).astype(t_dtype)
+                else:
+                    feed_dict[inp] = tokens_np.astype(t_dtype)
+            res = model(feed_dict)
+
+        vec = None
+        outputs = list(res.values()) if hasattr(res, "values") else [res]
+        for val in outputs:
+            val_arr = np.array(val)
+            if val_arr.ndim == 2 and val_arr.shape[-1] == 512:
+                vec = val_arr[0].astype(np.float32)
+                break
+            elif val_arr.ndim == 1 and val_arr.shape[0] == 512:
+                vec = val_arr.astype(np.float32)
+                break
+        if vec is None and len(outputs) > 0:
+            val_arr = np.array(outputs[0]).astype(np.float32)
+            if val_arr.ndim == 3 and val_arr.shape[-1] == 512:
+                vec = val_arr[0, -1]
             else:
-                feed_dict[inp] = tokens_pt.numpy().astype(t_dtype)
+                vec = val_arr.reshape(-1)[:512]
 
-        res = model(feed_dict)
-        vec = list(res.values())[0].reshape(-1).astype(np.float32)
-        norm = float(np.linalg.norm(vec)) + 1e-8
-        return (vec / norm).tolist()
+        if vec is not None and vec.size == 512:
+            norm = float(np.linalg.norm(vec)) + 1e-8
+            return (vec / norm).tolist()
     except Exception as exc:
         print(f"OpenCLIP text encoder OpenVINO inference error ({exc}); trying PyTorch OpenCLIP fallback...")
         try:
