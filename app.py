@@ -173,6 +173,7 @@ def extract_arcface_512d(crop_bgr: np.ndarray) -> Optional[List[float]]:
 
 # --- 3. OpenCLIP Multi-Modal Vector (512-d) ---
 _clip_tokenizer = None
+_clip_model = None
 
 def get_clip_tokenizer():
     global _clip_tokenizer
@@ -183,6 +184,18 @@ def get_clip_tokenizer():
         except Exception:
             _clip_tokenizer = None
     return _clip_tokenizer
+
+
+def get_clip_model():
+    global _clip_model
+    if _clip_model is None:
+        try:
+            import open_clip
+            _clip_model, _, _ = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion2b_s34b_b79k")
+            _clip_model.eval()
+        except Exception:
+            _clip_model = None
+    return _clip_model
 
 
 def extract_openclip_text_512d(text: str) -> Optional[List[float]]:
@@ -203,13 +216,39 @@ def extract_openclip_text_512d(text: str) -> Optional[List[float]]:
         return None
 
     try:
-        tokens = tokenizer([prompt]).numpy().astype(np.int32)
-        res = model(tokens)
+        tokens_pt = tokenizer([prompt])
+        tokens_np = tokens_pt.numpy().astype(np.int32)
+        
+        # Check model input names to pass tensor properly
+        inputs = model.inputs
+        if len(inputs) == 1:
+            res = model(tokens_np)
+        else:
+            # Multi-input OpenVINO models often require attention_mask or named inputs
+            feed_dict = {}
+            for inp in inputs:
+                name = inp.get_any_name()
+                if "mask" in name.lower():
+                    feed_dict[inp] = (tokens_np != 0).astype(np.int32)
+                else:
+                    feed_dict[inp] = tokens_np
+            res = model(feed_dict)
+
         vec = list(res.values())[0].reshape(-1).astype(np.float32)
         norm = float(np.linalg.norm(vec)) + 1e-8
         return (vec / norm).tolist()
     except Exception as exc:
-        print(f"OpenCLIP text encoder OpenVINO inference error: {exc}")
+        print(f"OpenCLIP text encoder OpenVINO inference error ({exc}); trying PyTorch OpenCLIP fallback...")
+        try:
+            import torch
+            clip_model = get_clip_model()
+            if clip_model is not None:
+                with torch.no_grad():
+                    features = clip_model.encode_text(tokens_pt)
+                    features /= features.norm(dim=-1, keepdim=True)
+                    return features.cpu().numpy().reshape(-1).astype(np.float32).tolist()
+        except Exception as pt_exc:
+            print(f"PyTorch OpenCLIP fallback also failed: {pt_exc}")
         return None
 
 
@@ -469,9 +508,29 @@ def embed_text(payload: dict):
     if not text or not str(text).strip():
         raise HTTPException(status_code=400, detail="Missing text/query in request payload")
 
+    model = (
+        get_openvino_model("openclip_text", "openclip_text_encoder.xml")
+        or get_openvino_model("openclip_text", "openclip_text_encoder.onnx")
+    )
+    tokenizer = get_clip_tokenizer()
+    
+    if model is None:
+        raise HTTPException(
+            status_code=503,
+            detail="OpenCLIP text encoder model file ('openclip_text_encoder.xml' or .onnx) not found in cloud container"
+        )
+    if tokenizer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="OpenCLIP tokenizer unavailable (open_clip module could not be loaded or initialized)"
+        )
+
     emb = extract_openclip_text_512d(str(text))
     if emb is None or len(emb) != 512:
-        raise HTTPException(status_code=503, detail="OpenCLIP text encoder model unavailable on microservice")
+        raise HTTPException(
+            status_code=503,
+            detail="OpenCLIP text encoder inference failed on microservice"
+        )
 
     return {
         "status": "success",
