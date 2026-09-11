@@ -20,16 +20,7 @@ COPY . .
 RUN git config --global --add safe.directory '*' && \
     git lfs install && \
     (git lfs pull || true) && \
-    python3 -c "\
-import os, urllib.request; \
-models = ['text_encoder.onnx', 'image_encoder.onnx', 'pa100k_osnet.bin', 'dinov2_vits14.bin', 'arcface_resnet50_survface.bin', 'osnet_17_15.bin']; \
-for m in models: \
-    if os.path.exists(m) and os.path.getsize(m) < 1000: \
-        url = f'https://media.githubusercontent.com/media/akashjape/surveillance-cloud-microservice/main/{m}'; \
-        print(f'Downloading full {m} from {url}...'); \
-        urllib.request.urlretrieve(url, m); \
-        print(f'Downloaded {m}: {os.path.getsize(m)} bytes') \
-"
+    python3 download_models.py
 
 ENV PORT=8080
 EXPOSE 8080
