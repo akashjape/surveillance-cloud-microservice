@@ -50,8 +50,12 @@ def get_ov_core() -> ov.Core:
 
 
 def get_openvino_model(name: str, xml_filename: str):
-    if name in _COMPILED_MODELS:
+    cache_key = f"{name}:{xml_filename}"
+    if cache_key in _COMPILED_MODELS and _COMPILED_MODELS[cache_key] is not None:
+        return _COMPILED_MODELS[cache_key]
+    if name in _COMPILED_MODELS and _COMPILED_MODELS[name] is not None:
         return _COMPILED_MODELS[name]
+
     candidate_paths = [
         Path(xml_filename),
         Path(".") / xml_filename,
@@ -74,10 +78,12 @@ def get_openvino_model(name: str, xml_filename: str):
                 compiled = core.compile_model(model, "CPU")
                 print(f"✅ Lazy Loaded OpenVINO Model: {p}")
                 _COMPILED_MODELS[name] = compiled
+                _COMPILED_MODELS[cache_key] = compiled
                 return compiled
             except Exception as e:
                 print(f"⚠️ OpenVINO compile error on {p}: {e}")
-    _COMPILED_MODELS[name] = None
+
+    _COMPILED_MODELS[cache_key] = None
     return None
 
 
@@ -209,11 +215,13 @@ def extract_openclip_text_512d(text: str) -> Optional[List[float]]:
         or get_openvino_model("openclip_text", "openclip_text_encoder.xml")
     )
     if model is None:
+        print("⚠️ text_encoder model not loaded in extract_openclip_text_512d")
         return None
 
     prompt = f"a surveillance camera crop of a {text.strip()}"
     tokenizer = get_clip_tokenizer()
     if tokenizer is None:
+        print("⚠️ tokenizer is None in extract_openclip_text_512d")
         return None
 
     try:
@@ -221,27 +229,46 @@ def extract_openclip_text_512d(text: str) -> Optional[List[float]]:
         tokens_np = tokens_pt.numpy() if hasattr(tokens_pt, "numpy") else np.array(tokens_pt)
         inputs = model.inputs
 
-        if len(inputs) == 1:
-            element_type_str = str(inputs[0].get_element_type()).lower()
-            is_int64 = "64" in element_type_str or "long" in element_type_str
-            t_dtype = np.int64 if is_int64 else np.int32
-            res = model(tokens_np.astype(t_dtype))
-        else:
-            feed_dict = {}
-            for inp in inputs:
-                name = inp.get_any_name().lower()
-                element_type_str = str(inp.get_element_type()).lower()
-                is_int64 = "64" in element_type_str or "long" in element_type_str
-                t_dtype = np.int64 if is_int64 else np.int32
+        # Robust multi-attempt inference dispatch for OpenVINO ONNX text models
+        res = None
+        for attempt_dtype in [np.int64, np.int32]:
+            t_arr = tokens_np.astype(attempt_dtype)
+            try:
+                res = model(t_arr)
+                if res is not None:
+                    break
+            except Exception:
+                pass
+            try:
+                res = model([t_arr])
+                if res is not None:
+                    break
+            except Exception:
+                pass
+            try:
+                feed_dict = {}
+                for inp in inputs:
+                    feed_dict[inp] = t_arr
+                res = model(feed_dict)
+                if res is not None:
+                    break
+            except Exception:
+                pass
+            try:
+                feed_dict = {}
+                for inp in inputs:
+                    feed_dict[inp.get_any_name()] = t_arr
+                res = model(feed_dict)
+                if res is not None:
+                    break
+            except Exception:
+                pass
 
-                if "mask" in name:
-                    feed_dict[inp] = (tokens_np != 0).astype(t_dtype)
-                else:
-                    feed_dict[inp] = tokens_np.astype(t_dtype)
-            res = model(feed_dict)
+        if res is None:
+            raise RuntimeError(f"All OpenVINO tensor dispatch attempts failed for {len(inputs)} inputs")
 
         vec = None
-        outputs = list(res.values()) if hasattr(res, "values") else [res]
+        outputs = list(res.values()) if hasattr(res, "values") else (res if isinstance(res, (list, tuple)) else [res])
         for val in outputs:
             val_arr = np.array(val)
             if val_arr.ndim == 2 and val_arr.shape[-1] == 512:
@@ -260,6 +287,8 @@ def extract_openclip_text_512d(text: str) -> Optional[List[float]]:
         if vec is not None and vec.size == 512:
             norm = float(np.linalg.norm(vec)) + 1e-8
             return (vec / norm).tolist()
+        else:
+            print(f"⚠️ Unexpected vector dimension from OpenVINO: {getattr(vec, 'shape', None)}")
     except Exception as exc:
         print(f"OpenCLIP text encoder OpenVINO inference error ({exc}); trying PyTorch OpenCLIP fallback...")
         try:
@@ -500,6 +529,109 @@ def debug_models():
         "model_files": found_files,
         "root_directory_files": os.listdir(".")[:50],
     }
+
+
+@app.get("/debug_text_encoder")
+def debug_text_encoder():
+    """Diagnostic endpoint to inspect text encoder ONNX loading, inputs, outputs, and tokenizer status."""
+    import traceback
+    info = {
+        "status": "testing",
+        "openvino_version": ov.__version__,
+        "model_files_on_disk": {},
+        "model_load_status": "pending",
+        "tokenizer_status": "pending",
+        "inference_status": "pending",
+    }
+    for fn in ["text_encoder.onnx", "openclip_text_encoder.onnx", "openclip_text_encoder.xml"]:
+        p = Path(fn)
+        info["model_files_on_disk"][fn] = {
+            "exists": p.exists(),
+            "size_bytes": p.stat().st_size if p.exists() else 0,
+        }
+
+    try:
+        model = get_openvino_model("openclip_text", "text_encoder.onnx")
+        if model is None:
+            info["model_load_status"] = "FAILED: get_openvino_model returned None"
+        else:
+            inputs = []
+            for inp in model.inputs:
+                try:
+                    inp_name = inp.get_any_name()
+                except Exception:
+                    inp_name = str(inp)
+                inputs.append({
+                    "name": inp_name,
+                    "shape": str(inp.get_partial_shape()),
+                    "type": str(inp.get_element_type()),
+                })
+            outputs = []
+            for out in model.outputs:
+                try:
+                    out_name = out.get_any_name()
+                except Exception:
+                    out_name = str(out)
+                outputs.append({
+                    "name": out_name,
+                    "shape": str(out.get_partial_shape()),
+                    "type": str(out.get_element_type()),
+                })
+            info["model_load_status"] = {
+                "result": "SUCCESS",
+                "inputs": inputs,
+                "outputs": outputs,
+            }
+    except Exception as exc:
+        info["model_load_status"] = {
+            "result": "EXCEPTION",
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+
+    try:
+        tok = get_clip_tokenizer()
+        if tok is None:
+            info["tokenizer_status"] = "FAILED: get_clip_tokenizer returned None"
+        else:
+            t = tok(["a person in blue shirt"])
+            info["tokenizer_status"] = {
+                "result": "SUCCESS",
+                "shape": list(t.shape),
+                "dtype": str(t.dtype),
+            }
+    except Exception as exc:
+        info["tokenizer_status"] = {
+            "result": "EXCEPTION",
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+
+    try:
+        emb = extract_openclip_text_512d("a person in blue shirt")
+        if emb is not None:
+            info["inference_status"] = {
+                "result": "SUCCESS",
+                "dimension": len(emb),
+                "norm": round(float(np.linalg.norm(emb)), 6),
+                "sample": [round(x, 4) for x in emb[:5]],
+            }
+        else:
+            info["inference_status"] = "FAILED: extract_openclip_text_512d returned None"
+    except Exception as exc:
+        info["inference_status"] = {
+            "result": "EXCEPTION",
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+
+    return info
+
+
+@app.get("/embed_text")
+def embed_text_get(text: str = "person wearing blue shirt"):
+    """GET query wrapper for embed_text to allow browser and URL testing."""
+    return embed_text({"text": text})
 
 
 @app.post("/embed_dinov2")
