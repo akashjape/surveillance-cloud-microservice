@@ -204,8 +204,9 @@ def extract_openclip_text_512d(text: str) -> Optional[List[float]]:
         return None
 
     model = (
-        get_openvino_model("openclip_text", "openclip_text_encoder.xml")
+        get_openvino_model("openclip_text", "text_encoder.onnx")
         or get_openvino_model("openclip_text", "openclip_text_encoder.onnx")
+        or get_openvino_model("openclip_text", "openclip_text_encoder.xml")
     )
     if model is None:
         return None
@@ -217,23 +218,20 @@ def extract_openclip_text_512d(text: str) -> Optional[List[float]]:
 
     try:
         tokens_pt = tokenizer([prompt])
-        tokens_np = tokens_pt.numpy().astype(np.int32)
-        
-        # Check model input names to pass tensor properly
         inputs = model.inputs
-        if len(inputs) == 1:
-            res = model(tokens_np)
-        else:
-            # Multi-input OpenVINO models often require attention_mask or named inputs
-            feed_dict = {}
-            for inp in inputs:
-                name = inp.get_any_name()
-                if "mask" in name.lower():
-                    feed_dict[inp] = (tokens_np != 0).astype(np.int32)
-                else:
-                    feed_dict[inp] = tokens_np
-            res = model(feed_dict)
+        feed_dict = {}
+        for inp in inputs:
+            name = inp.get_any_name().lower()
+            element_type_str = str(inp.get_element_type()).lower()
+            is_int64 = "64" in element_type_str or "long" in element_type_str
+            t_dtype = np.int64 if is_int64 else np.int32
 
+            if "mask" in name:
+                feed_dict[inp] = (tokens_pt.numpy() != 0).astype(t_dtype)
+            else:
+                feed_dict[inp] = tokens_pt.numpy().astype(t_dtype)
+
+        res = model(feed_dict)
         vec = list(res.values())[0].reshape(-1).astype(np.float32)
         norm = float(np.linalg.norm(vec)) + 1e-8
         return (vec / norm).tolist()
@@ -254,8 +252,9 @@ def extract_openclip_text_512d(text: str) -> Optional[List[float]]:
 
 def extract_openclip_512d(crop_bgr: np.ndarray) -> Optional[List[float]]:
     model = (
-        get_openvino_model("openclip", "openclip_image_encoder.xml")
+        get_openvino_model("openclip", "image_encoder.onnx")
         or get_openvino_model("openclip", "openclip_image_encoder.onnx")
+        or get_openvino_model("openclip", "openclip_image_encoder.xml")
     )
     if model is None:
         return None
@@ -267,10 +266,13 @@ def extract_openclip_512d(crop_bgr: np.ndarray) -> Optional[List[float]]:
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         norm_img = (rgb - mean) / std
         blob = np.transpose(norm_img, (2, 0, 1))[np.newaxis, ...]
-        out = model(blob)[0][0]
+        out = model(blob)[0]
+        if out.ndim > 1:
+            out = out[0]
         norm = float(np.linalg.norm(out)) + 1e-8
         return (out / norm).tolist()
-    except Exception:
+    except Exception as exc:
+        print(f"OpenCLIP image encoder inference error: {exc}")
         return None
 
 
@@ -509,15 +511,16 @@ def embed_text(payload: dict):
         raise HTTPException(status_code=400, detail="Missing text/query in request payload")
 
     model = (
-        get_openvino_model("openclip_text", "openclip_text_encoder.xml")
+        get_openvino_model("openclip_text", "text_encoder.onnx")
         or get_openvino_model("openclip_text", "openclip_text_encoder.onnx")
+        or get_openvino_model("openclip_text", "openclip_text_encoder.xml")
     )
     tokenizer = get_clip_tokenizer()
     
     if model is None:
         raise HTTPException(
             status_code=503,
-            detail="OpenCLIP text encoder model file ('openclip_text_encoder.xml' or .onnx) not found in cloud container"
+            detail="OpenCLIP text encoder model file ('text_encoder.onnx' or 'openclip_text_encoder.xml') not found in cloud container"
         )
     if tokenizer is None:
         raise HTTPException(
