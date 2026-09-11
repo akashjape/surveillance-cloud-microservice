@@ -49,6 +49,26 @@ def get_ov_core() -> ov.Core:
     return _ov_core
 
 
+def ensure_model_file_hydrated(file_path: Path) -> None:
+    """If file or its companion .bin is a Git LFS pointer (< 1000 bytes), hydrate it from GitHub media CDN."""
+    candidates_to_check = [file_path]
+    if file_path.suffix.lower() == ".xml":
+        bin_path = file_path.with_suffix(".bin")
+        if bin_path.exists():
+            candidates_to_check.append(bin_path)
+
+    for target in candidates_to_check:
+        if target.exists() and target.stat().st_size < 1000:
+            print(f"⚠️ Model asset {target} is only {target.stat().st_size} bytes (Git LFS pointer). Hydrating from GitHub CDN...")
+            try:
+                import urllib.request
+                url = f"https://media.githubusercontent.com/media/akashjape/surveillance-cloud-microservice/main/{target.name}"
+                urllib.request.urlretrieve(url, str(target))
+                print(f"✅ Successfully hydrated {target.name}: {target.stat().st_size} bytes")
+            except Exception as dl_err:
+                print(f"❌ Failed to hydrate {target.name}: {dl_err}")
+
+
 def get_openvino_model(name: str, xml_filename: str):
     cache_key = f"{name}:{xml_filename}"
     if cache_key in _COMPILED_MODELS and _COMPILED_MODELS[cache_key] is not None:
@@ -72,6 +92,7 @@ def get_openvino_model(name: str, xml_filename: str):
                     candidate_paths.append(found)
     for p in candidate_paths:
         if p.exists():
+            ensure_model_file_hydrated(p)
             try:
                 core = get_ov_core()
                 model = core.read_model(str(p))
@@ -310,24 +331,44 @@ def extract_openclip_512d(crop_bgr: np.ndarray) -> Optional[List[float]]:
         or get_openvino_model("openclip", "openclip_image_encoder.onnx")
         or get_openvino_model("openclip", "openclip_image_encoder.xml")
     )
-    if model is None:
-        return None
+    if model is not None:
+        try:
+            resized = cv2.resize(crop_bgr, (224, 224)).astype(np.float32) / 255.0
+            # Normalize with CLIP ImageNet stats
+            mean = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32).reshape(1, 1, 3)
+            std = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32).reshape(1, 1, 3)
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            norm_img = (rgb - mean) / std
+            blob = np.transpose(norm_img, (2, 0, 1))[np.newaxis, ...]
+            out = model(blob)[0]
+            if out.ndim > 1:
+                out = out[0]
+            norm = float(np.linalg.norm(out)) + 1e-8
+            return (out / norm).tolist()
+        except Exception as exc:
+            print(f"OpenCLIP image encoder inference error: {exc}")
+
+    # Fallback to PyTorch OpenCLIP
     try:
-        resized = cv2.resize(crop_bgr, (224, 224)).astype(np.float32) / 255.0
-        # Normalize with CLIP ImageNet stats
-        mean = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32).reshape(1, 1, 3)
-        std = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32).reshape(1, 1, 3)
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        norm_img = (rgb - mean) / std
-        blob = np.transpose(norm_img, (2, 0, 1))[np.newaxis, ...]
-        out = model(blob)[0]
-        if out.ndim > 1:
-            out = out[0]
-        norm = float(np.linalg.norm(out)) + 1e-8
-        return (out / norm).tolist()
-    except Exception as exc:
-        print(f"OpenCLIP image encoder inference error: {exc}")
-        return None
+        import torch
+        clip_model = get_clip_model()
+        if clip_model is not None:
+            rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(rgb)
+            resized = pil_img.resize((224, 224), Image.Resampling.BICUBIC)
+            arr = np.array(resized, dtype=np.float32) / 255.0
+            mean = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
+            std = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+            norm_arr = (arr - mean) / std
+            tensor = torch.from_numpy(np.transpose(norm_arr, (2, 0, 1))).unsqueeze(0).float()
+            with torch.no_grad():
+                feat = clip_model.encode_image(tensor)
+                feat /= feat.norm(dim=-1, keepdim=True)
+                return feat.cpu().numpy().reshape(-1).astype(np.float32).tolist()
+    except Exception as pt_err:
+        print(f"PyTorch OpenCLIP image fallback failed: {pt_err}")
+
+    return None
 
 
 # --- 4. PA-100K Person Attributes ---
